@@ -259,4 +259,109 @@ describe("dispatchTelegramMessage draft streaming", () => {
       }),
     );
   });
+
+  it("stops streaming and sends tool failures as separate messages", async () => {
+    const draftStream = createDraftStream(999);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text: "Useful partial answer" });
+        dispatcherOptions.onError?.(new Error("Tool execution failed"), { kind: "tool" });
+        return { queuedFinal: false };
+      },
+    );
+    deliverReplies.mockResolvedValue({ delivered: true });
+
+    await dispatchWithContext({ context: createContext(), streamMode: "partial" });
+
+    expect(draftStream.stop).toHaveBeenCalled();
+    expect(draftStream.clear).not.toHaveBeenCalled();
+    expect(deliverReplies).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replies: [expect.objectContaining({ text: "Tool execution failed" })],
+      }),
+    );
+  });
+
+  it("keeps block-mode preview intact and emits error separately", async () => {
+    const draftStream = createDraftStream(111);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text: "Block draft" });
+        dispatcherOptions.onError?.(new Error("Block tool error"), { kind: "tool" });
+        return { queuedFinal: false };
+      },
+    );
+    deliverReplies.mockResolvedValue({ delivered: true });
+
+    await dispatchWithContext({ context: createContext(), streamMode: "block" });
+
+    expect(draftStream.stop).toHaveBeenCalled();
+    expect(draftStream.clear).not.toHaveBeenCalled();
+    expect(deliverReplies).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replies: [expect.objectContaining({ text: "Block tool error" })],
+      }),
+    );
+  });
+
+  it("does not send duplicate error notices after preview finalization", async () => {
+    const draftStream = createDraftStream(999);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "Final answer" }, { kind: "final" });
+      dispatcherOptions.onError?.(new Error("Late failure"), { kind: "tool" });
+      return { queuedFinal: true };
+    });
+    editMessageTelegram.mockResolvedValue({ ok: true, chatId: "123", messageId: "999" });
+    deliverReplies.mockResolvedValue({ delivered: true });
+
+    await dispatchWithContext({ context: createContext() });
+
+    expect(editMessageTelegram).toHaveBeenCalledWith(123, 999, "Final answer", expect.any(Object));
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("keeps non-streaming error behavior unchanged", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      dispatcherOptions.onError?.(new Error("No stream error"), { kind: "tool" });
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "off",
+    });
+
+    expect(createTelegramDraftStream).not.toHaveBeenCalled();
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("serializes rapid error notices", async () => {
+    const draftStream = createDraftStream(999);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      dispatcherOptions.onError?.(new Error("First error"), { kind: "tool" });
+      dispatcherOptions.onError?.(new Error("Second error"), { kind: "tool" });
+      return { queuedFinal: false };
+    });
+    deliverReplies.mockResolvedValue({ delivered: true });
+
+    await dispatchWithContext({ context: createContext() });
+
+    expect(deliverReplies).toHaveBeenCalledTimes(2);
+    expect(deliverReplies).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        replies: [expect.objectContaining({ text: "First error" })],
+      }),
+    );
+    expect(deliverReplies).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        replies: [expect.objectContaining({ text: "Second error" })],
+      }),
+    );
+  });
 });

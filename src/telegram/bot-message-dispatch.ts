@@ -30,6 +30,19 @@ import { cacheSticker, describeStickerImage } from "./sticker-cache.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
 
+const resolveReplyErrorText = (err: unknown): string => {
+  if (typeof err === "string") {
+    const trimmed = err.trim();
+    return trimmed || "Sorry, I encountered an error while preparing the reply.";
+  }
+  if (err instanceof Error) {
+    const trimmed = err.message.trim();
+    return trimmed || "Sorry, I encountered an error while preparing the reply.";
+  }
+  const fallback = String(err).trim();
+  return fallback || "Sorry, I encountered an error while preparing the reply.";
+};
+
 async function resolveStickerVisionSupport(cfg: OpenClawConfig, agentId: string) {
   try {
     const catalog = await loadModelCatalog({ config: cfg });
@@ -249,6 +262,9 @@ export const dispatchTelegramMessage = async ({
     skippedNonSilent: 0,
   };
   let finalizedViaPreviewMessage = false;
+  let preserveDraftPreviewOnError = false;
+  let errorNoticeDelivered = false;
+  let errorDeliveryQueue: Promise<void> = Promise.resolve();
   const clearGroupHistory = () => {
     if (isGroup && historyKey) {
       clearHistoryEntriesIfEnabled({ historyMap: groupHistories, historyKey, limit: historyLimit });
@@ -334,6 +350,40 @@ export const dispatchTelegramMessage = async ({
         },
         onError: (err, info) => {
           runtime.error?.(danger(`telegram ${info.kind} reply failed: ${String(err)}`));
+
+          // When streaming is active, freeze the preview immediately so partial useful
+          // content is preserved. Tool/runtime error text must be delivered as a fresh
+          // message instead of mutating the preview message in place.
+          draftStream?.stop();
+
+          if (!draftStream || finalizedViaPreviewMessage) {
+            return;
+          }
+
+          if (typeof draftStream.messageId() === "number") {
+            preserveDraftPreviewOnError = true;
+          }
+
+          const errorText = resolveReplyErrorText(err);
+          errorDeliveryQueue = errorDeliveryQueue
+            .then(async () => {
+              if (finalizedViaPreviewMessage) {
+                return;
+              }
+              const result = await deliverReplies({
+                ...deliveryBaseOptions,
+                replies: [{ text: errorText }],
+              });
+              if (result.delivered) {
+                deliveryState.delivered = true;
+                errorNoticeDelivered = true;
+              }
+            })
+            .catch((sendErr) => {
+              runtime.error?.(
+                danger(`telegram error notice failed (${info.kind}): ${String(sendErr)}`),
+              );
+            });
         },
         onReplyStart: createTypingCallbacks({
           start: sendTyping,
@@ -355,11 +405,13 @@ export const dispatchTelegramMessage = async ({
       },
     }));
   } finally {
-    if (!finalizedViaPreviewMessage) {
+    if (!finalizedViaPreviewMessage && !preserveDraftPreviewOnError) {
       await draftStream?.clear();
     }
     draftStream?.stop();
   }
+  await errorDeliveryQueue;
+
   let sentFallback = false;
   if (!deliveryState.delivered && deliveryState.skippedNonSilent > 0) {
     const result = await deliverReplies({
@@ -369,7 +421,7 @@ export const dispatchTelegramMessage = async ({
     sentFallback = result.delivered;
   }
 
-  const hasFinalResponse = queuedFinal || sentFallback;
+  const hasFinalResponse = queuedFinal || sentFallback || errorNoticeDelivered;
   if (!hasFinalResponse) {
     clearGroupHistory();
     return;
